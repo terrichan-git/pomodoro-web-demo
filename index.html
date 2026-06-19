@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pomodoro</title>
+<style>
+  :root {
+    --bg: #14151a;
+    --fg: #e7e9ee;
+    --muted: #7f8493;
+    --accent: #ff6b6b;        /* focus */
+    --accent-break: #4ecdc4;  /* break */
+    --accent-long: #6c8cff;   /* long break */
+    --panel: #1c1e26;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background-color 0.6s ease;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Mode-based background tint */
+  body[data-mode="focus"]     { background: #14151a; }
+  body[data-mode="break"]     { background: #131a19; }
+  body[data-mode="longBreak"] { background: #14161d; }
+
+  .app {
+    width: 100%;
+    max-width: 440px;
+    padding: 32px 24px;
+    text-align: center;
+  }
+
+  .mode {
+    font-size: 0.95rem;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--mode-color, var(--accent));
+    transition: color 0.6s ease;
+    margin-bottom: 8px;
+  }
+
+  .time {
+    font-size: clamp(4.5rem, 22vw, 8rem);
+    font-weight: 200;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    margin: 4px 0 8px;
+    color: var(--fg);
+  }
+
+  .sessions {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 32px;
+  }
+  .sessions b { color: var(--fg); font-weight: 600; }
+
+  .controls {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+  }
+
+  button {
+    appearance: none;
+    border: 1px solid #2c2f3a;
+    background: var(--panel);
+    color: var(--fg);
+    font-size: 0.95rem;
+    font-weight: 500;
+    padding: 12px 22px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.05s ease;
+    min-width: 96px;
+  }
+  button:hover { background: #262934; border-color: #3a3e4c; }
+  button:active { transform: translateY(1px); }
+  button.primary {
+    background: var(--mode-color, var(--accent));
+    border-color: transparent;
+    color: #14151a;
+    font-weight: 600;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+
+  .hint {
+    margin-top: 24px;
+    color: var(--muted);
+    font-size: 0.78rem;
+    letter-spacing: 0.02em;
+  }
+  .hint kbd {
+    background: var(--panel);
+    border: 1px solid #2c2f3a;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: inherit;
+    font-size: 0.75rem;
+  }
+
+  /* Screen flash fallback when audio is blocked */
+  .flash {
+    position: fixed;
+    inset: 0;
+    background: #fff;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 10;
+  }
+  .flash.active {
+    animation: flash 0.55s ease;
+  }
+  @keyframes flash {
+    0%   { opacity: 0; }
+    15%  { opacity: 0.85; }
+    100% { opacity: 0; }
+  }
+</style>
+</head>
+<body data-mode="focus">
+  <div class="flash" id="flash" aria-hidden="true"></div>
+
+  <main class="app">
+    <div class="mode" id="modeLabel">Focus</div>
+    <div class="time" id="time">25:00</div>
+    <div class="sessions">Completed focus sessions: <b id="count">0</b></div>
+
+    <div class="controls">
+      <button class="primary" id="startBtn">Start</button>
+      <button id="resetBtn">Reset</button>
+    </div>
+
+    <div class="hint">
+      <kbd>Space</kbd> start / pause &nbsp;·&nbsp; <kbd>R</kbd> reset
+    </div>
+  </main>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ *  Pure logic
+ *  These functions hold no state of their own. They take a state
+ *  object (and inputs) and return new values, which makes the timing
+ *  and mode-transition rules easy to reason about and test.
+ * ------------------------------------------------------------------ */
+
+var DURATIONS = {
+  focus:     25 * 60,
+  break:      5 * 60,
+  longBreak: 15 * 60
+};
+
+var MODE_META = {
+  focus:     { label: "Focus",      color: "#ff6b6b" },
+  break:     { label: "Break",      color: "#4ecdc4" },
+  longBreak: { label: "Long break", color: "#6c8cff" }
+};
+
+var LONG_BREAK_EVERY = 4;
+
+/**
+ * Remaining whole seconds until an absolute target timestamp.
+ * Clamped to >= 0. This is computed from the wall clock on every tick,
+ * so it stays correct even if the tab was backgrounded / throttled.
+ */
+function remainingSeconds(targetTs, now) {
+  return Math.max(0, Math.ceil((targetTs - now) / 1000));
+}
+
+/** Format a number of seconds as MM:SS. */
+function formatTime(totalSeconds) {
+  var s = Math.max(0, Math.floor(totalSeconds));
+  var m = Math.floor(s / 60);
+  var sec = s % 60;
+  return String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
+}
+
+/**
+ * Given the mode that just finished and how many focus blocks have been
+ * completed (including the one that may have just finished), decide the
+ * next mode. Pure: same inputs -> same output.
+ *
+ * After a focus block: long break every 4th focus, otherwise short break.
+ * After any break: back to focus.
+ */
+function nextMode(finishedMode, completedFocus) {
+  if (finishedMode === "focus") {
+    return (completedFocus % LONG_BREAK_EVERY === 0) ? "longBreak" : "break";
+  }
+  return "focus";
+}
+
+/* ------------------------------------------------------------------ *
+ *  Application state (the only mutable bits)
+ * ------------------------------------------------------------------ */
+
+var state = {
+  mode: "focus",
+  running: false,
+  targetTs: 0,          // absolute ms timestamp the current block ends at
+  remaining: DURATIONS.focus, // last-known remaining seconds (for pause/display)
+  completedFocus: 0
+};
+
+var tickHandle = null;
+var audioCtx = null;
+
+/* ------------------------------------------------------------------ *
+ *  DOM
+ * ------------------------------------------------------------------ */
+
+var el = {
+  body:    document.body,
+  mode:    document.getElementById("modeLabel"),
+  time:    document.getElementById("time"),
+  count:   document.getElementById("count"),
+  start:   document.getElementById("startBtn"),
+  reset:   document.getElementById("resetBtn"),
+  flash:   document.getElementById("flash")
+};
+
+/* ------------------------------------------------------------------ *
+ *  Rendering
+ * ------------------------------------------------------------------ */
+
+function render() {
+  var meta = MODE_META[state.mode];
+  var timeStr = formatTime(state.remaining);
+
+  el.time.textContent = timeStr;
+  el.mode.textContent = meta.label;
+  el.count.textContent = state.completedFocus;
+  el.start.textContent = state.running ? "Pause" : "Start";
+
+  el.body.setAttribute("data-mode", state.mode);
+  el.body.style.setProperty("--mode-color", meta.color);
+
+  document.title = timeStr + " · " + meta.label;
+}
+
+/* ------------------------------------------------------------------ *
+ *  Feedback: beep (Web Audio) with screen-flash fallback
+ * ------------------------------------------------------------------ */
+
+function beep() {
+  try {
+    if (!audioCtx) {
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error("no Web Audio");
+      audioCtx = new Ctx();
+    }
+    if (audioCtx.state === "suspended") {
+      // May reject if not resumed via a user gesture.
+      audioCtx.resume();
+    }
+    if (audioCtx.state !== "running") {
+      throw new Error("audio not running");
+    }
+
+    var osc = audioCtx.createOscillator();
+    var gain = audioCtx.createGain();
+    var t = audioCtx.currentTime;
+
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(880, t);
+    osc.frequency.setValueAtTime(660, t + 0.12);
+
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.3, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + 0.36);
+  } catch (e) {
+    flashScreen();
+  }
+}
+
+function flashScreen() {
+  el.flash.classList.remove("active");
+  // Force reflow so the animation can restart if it fires twice quickly.
+  void el.flash.offsetWidth;
+  el.flash.classList.add("active");
+}
+
+/* ------------------------------------------------------------------ *
+ *  Timing loop
+ * ------------------------------------------------------------------ */
+
+function tick() {
+  if (!state.running) return;
+
+  var now = Date.now();
+  state.remaining = remainingSeconds(state.targetTs, now);
+
+  if (state.remaining <= 0) {
+    handleBlockComplete();
+    return;
+  }
+  render();
+}
+
+function startTicking() {
+  if (tickHandle !== null) return;
+  tickHandle = setInterval(tick, 250);
+}
+
+function stopTicking() {
+  if (tickHandle !== null) {
+    clearInterval(tickHandle);
+    tickHandle = null;
+  }
+}
+
+/**
+ * A block reached zero: count focus sessions, signal, then advance.
+ */
+function handleBlockComplete() {
+  var finishedMode = state.mode;
+
+  if (finishedMode === "focus") {
+    state.completedFocus += 1;
+  }
+
+  beep();
+
+  var upcoming = nextMode(finishedMode, state.completedFocus);
+  state.mode = upcoming;
+  state.remaining = DURATIONS[upcoming];
+  // Next block auto-starts and keeps running, anchored to the wall clock.
+  state.targetTs = Date.now() + DURATIONS[upcoming] * 1000;
+
+  render();
+}
+
+/* ------------------------------------------------------------------ *
+ *  Controls
+ * ------------------------------------------------------------------ */
+
+function start() {
+  if (state.running) return;
+  state.running = true;
+  // Anchor the absolute end time from the remaining seconds we have.
+  state.targetTs = Date.now() + state.remaining * 1000;
+  startTicking();
+  // Try to unlock audio while we're inside a user gesture.
+  primeAudio();
+  render();
+}
+
+function pause() {
+  if (!state.running) return;
+  // Capture the up-to-the-moment remaining before stopping.
+  state.remaining = remainingSeconds(state.targetTs, Date.now());
+  state.running = false;
+  stopTicking();
+  render();
+}
+
+function toggle() {
+  state.running ? pause() : start();
+}
+
+function reset() {
+  state.running = false;
+  stopTicking();
+  state.mode = "focus";
+  state.remaining = DURATIONS.focus;
+  state.targetTs = 0;
+  state.completedFocus = 0;
+  render();
+}
+
+function primeAudio() {
+  try {
+    if (!audioCtx) {
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      if (Ctx) audioCtx = new Ctx();
+    }
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+  } catch (e) { /* ignore — beep() will fall back to a flash */ }
+}
+
+/* ------------------------------------------------------------------ *
+ *  Wiring
+ * ------------------------------------------------------------------ */
+
+el.start.addEventListener("click", toggle);
+el.reset.addEventListener("click", reset);
+
+document.addEventListener("keydown", function (e) {
+  // Ignore if a modifier is held so browser shortcuts still work.
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  if (e.code === "Space" || e.key === " ") {
+    e.preventDefault();
+    toggle();
+  } else if (e.key === "r" || e.key === "R") {
+    reset();
+  }
+});
+
+// Re-sync immediately when the tab becomes visible again, rather than
+// waiting for the next interval tick.
+document.addEventListener("visibilitychange", function () {
+  if (!document.hidden) tick();
+});
+
+render();
+</script>
+</body>
+</html>
